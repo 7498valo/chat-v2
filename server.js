@@ -17,7 +17,7 @@ app.use(express.json({ limit: '10kb' })); // JSONサイズ制限
 // レート制限設定
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15分
-  max: 10, // 15分あたり最大10リクエスト
+  max: 1000, // 15分あたり最大10リクエスト
   message: { error: 'リクエストが多すぎます。しばらくしてから再試行してください。' },
   standardHeaders: true,
   legacyHeaders: false,

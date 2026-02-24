@@ -1,7 +1,7 @@
 {
-  "name": "line-extension-backend",
+  "name": "line-chat-backend",
   "version": "1.0.0",
-  "description": "LINEライクなメッセージ拡張機能のバックエンド",
+  "description": "LINE風チャット バックエンド",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -15,5 +15,8 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

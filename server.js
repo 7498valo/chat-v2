@@ -1,232 +1,247 @@
-// ============================================================
-//  LINE拡張機能 バックエンドサーバー
-//  Express (REST API) + ws (WebSocket) on port 3000
-// ============================================================
+/**
+ * LINE風チャット バックエンド
+ * Express + WebSocket (ws)
+ * Render対応: process.env.PORT を使用
+ */
 
-const express = require("express");
-const http = require("http");
+const express   = require("express");
+const http      = require("http");
 const WebSocket = require("ws");
-const cors = require("cors");
-const { v4: uuidv4 } = require("uuid");
+const cors      = require("cors");
+const { v4: uuid } = require("uuid");
 
+// ─────────────────────────────────────────
+//  App setup
+// ─────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ──────────────────────────────────────────────────────────
-//  In-Memory DB
-// ──────────────────────────────────────────────────────────
-const db = {
-  users: [
-    { id: "user-1", name: "田中さくら", avatar: "🌸", status: "online" },
-    { id: "user-2", name: "鈴木健太",   avatar: "🎮", status: "offline" },
-    { id: "user-3", name: "佐藤花子",   avatar: "🌺", status: "online" },
-    { id: "user-4", name: "山田グループ", avatar: "👥", status: "online", isGroup: true, members: ["user-1","user-2","user-3"] },
-    { id: "user-5", name: "Work Team",  avatar: "💼", status: "offline", isGroup: true },
-  ],
-  // roomId → message[]
-  messages: {
-    "room-1": [
-      { id: uuidv4(), roomId: "room-1", senderId: "user-1", text: "こんにちは！", type: "text", ts: Date.now() - 3600000 },
-      { id: uuidv4(), roomId: "room-1", senderId: "me",     text: "やあ！元気？", type: "text", ts: Date.now() - 3500000 },
-      { id: uuidv4(), roomId: "room-1", senderId: "user-1", text: "元気だよ〜週末どうだった？", type: "text", ts: Date.now() - 3400000 },
-    ],
-    "room-2": [
-      { id: uuidv4(), roomId: "room-2", senderId: "user-2", text: "ゲームしようぜ！", type: "text", ts: Date.now() - 7200000 },
-      { id: uuidv4(), roomId: "room-2", senderId: "me",     text: "いいね！何時から？", type: "text", ts: Date.now() - 7100000 },
-    ],
-    "room-3": [
-      { id: uuidv4(), roomId: "room-3", senderId: "user-4", text: "明日の予定は？", type: "text", ts: Date.now() - 86400000 },
-    ],
-    "room-4": [
-      { id: uuidv4(), roomId: "room-4", senderId: "user-3", text: "また話しましょう！", type: "text", ts: Date.now() - 172800000 },
-    ],
-    "room-5": [
-      { id: uuidv4(), roomId: "room-5", senderId: "user-5", text: "会議は3時からです", type: "text", ts: Date.now() - 259200000 },
-    ],
-  },
-  // roomId → { contactId, unread }
-  rooms: [
-    { id: "room-1", contactId: "user-1", unread: 2 },
-    { id: "room-2", contactId: "user-2", unread: 0 },
-    { id: "room-3", contactId: "user-4", unread: 5 },
-    { id: "room-4", contactId: "user-3", unread: 0 },
-    { id: "room-5", contactId: "user-5", unread: 1 },
-  ],
+// ─────────────────────────────────────────
+//  In-memory store
+// ─────────────────────────────────────────
+
+/**
+ * users: Map<userId, { id, name, avatar, ws }>
+ * rooms: Map<roomId, { id, members:[uid,uid], messages:[], unread:{uid:n} }>
+ */
+const users = new Map();
+const rooms = new Map();
+
+// ─────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────
+
+// 2人のルームIDを決定論的に生成
+const roomId = (a, b) => "r:" + [a, b].sort().join(":");
+
+// WebSocketが開いているか
+const isOpen = (ws) => ws && ws.readyState === WebSocket.OPEN;
+
+// 特定ユーザーへ送信
+const sendTo = (uid, data) => {
+  const u = users.get(uid);
+  if (u && isOpen(u.ws)) u.ws.send(JSON.stringify(data));
 };
 
-// ──────────────────────────────────────────────────────────
-//  REST API
-// ──────────────────────────────────────────────────────────
-
-// GET /api/rooms  — トーク一覧
-app.get("/api/rooms", (req, res) => {
-  const result = db.rooms.map((room) => {
-    const contact = db.users.find((u) => u.id === room.contactId);
-    const msgs = db.messages[room.id] || [];
-    const lastMsg = msgs[msgs.length - 1] || null;
-    return {
-      ...room,
-      contact,
-      lastMessage: lastMsg,
-    };
+// 全ユーザーへ送信（除外あり）
+const broadcast = (data, excludeId = null) => {
+  const raw = JSON.stringify(data);
+  users.forEach((u, uid) => {
+    if (uid !== excludeId && isOpen(u.ws)) u.ws.send(raw);
   });
-  // 最新メッセージ順で並び替え
-  result.sort((a, b) => {
-    const ta = a.lastMessage?.ts || 0;
-    const tb = b.lastMessage?.ts || 0;
-    return tb - ta;
+};
+
+// ルームの両メンバーへ送信
+const broadcastRoom = (rid, data) => {
+  const room = rooms.get(rid);
+  if (!room) return;
+  const raw = JSON.stringify(data);
+  room.members.forEach((uid) => {
+    const u = users.get(uid);
+    if (u && isOpen(u.ws)) u.ws.send(raw);
   });
-  res.json(result);
-});
+};
 
-// GET /api/rooms/:roomId/messages  — メッセージ一覧
-app.get("/api/rooms/:roomId/messages", (req, res) => {
-  const msgs = db.messages[req.params.roomId] || [];
-  res.json(msgs);
-});
+// ユーザーの公開情報（ws除外）
+const pubUser = (u) => ({ id: u.id, name: u.name, avatar: u.avatar });
 
-// POST /api/rooms/:roomId/messages  — メッセージ送信 (REST fallback)
-app.post("/api/rooms/:roomId/messages", (req, res) => {
-  const { text, type = "text" } = req.body;
-  if (!text) return res.status(400).json({ error: "text is required" });
-
-  const msg = {
-    id: uuidv4(),
-    roomId: req.params.roomId,
-    senderId: "me",
-    text,
-    type,
-    ts: Date.now(),
+// ルームの公開情報（myIdから見た情報）
+const pubRoom = (room, myId) => {
+  const partnerId = room.members.find((id) => id !== myId);
+  const partner   = users.get(partnerId);
+  const lastMsg   = room.messages[room.messages.length - 1] ?? null;
+  return {
+    id:          room.id,
+    partnerId,
+    partner:     partner ? pubUser(partner) : { id: partnerId, name: "（退出済み）", avatar: "👻" },
+    online:      !!partner,
+    lastMessage: lastMsg,
+    unread:      room.unread[myId] ?? 0,
   };
+};
 
-  if (!db.messages[req.params.roomId]) db.messages[req.params.roomId] = [];
-  db.messages[req.params.roomId].push(msg);
+// ─────────────────────────────────────────
+//  REST endpoints
+// ─────────────────────────────────────────
 
-  // unread reset for "me"
-  const room = db.rooms.find((r) => r.id === req.params.roomId);
-  if (room) room.unread = 0;
+// ヘルスチェック / ルート
+app.get("/", (_req, res) => res.json({ status: "ok", service: "line-chat", users: users.size }));
 
-  // WebSocket broadcast
-  broadcastToRoom(req.params.roomId, { type: "NEW_MESSAGE", payload: msg });
-
-  res.status(201).json(msg);
+// オンラインユーザー一覧
+app.get("/api/users", (_req, res) => {
+  res.json([...users.values()].map(pubUser));
 });
 
-// PATCH /api/rooms/:roomId/read  — 既読
-app.patch("/api/rooms/:roomId/read", (req, res) => {
-  const room = db.rooms.find((r) => r.id === req.params.roomId);
-  if (room) room.unread = 0;
-  res.json({ ok: true });
-});
-
-// GET /api/contacts  — 連絡先一覧
-app.get("/api/contacts", (req, res) => {
-  res.json(db.users);
-});
-
-// ──────────────────────────────────────────────────────────
-//  HTTP + WebSocket サーバー
-// ──────────────────────────────────────────────────────────
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-
-// roomId → Set<WebSocket>
-const roomClients = new Map();
-
-function broadcastToRoom(roomId, data) {
-  const clients = roomClients.get(roomId) || new Set();
-  const payload = JSON.stringify(data);
-  clients.forEach((ws) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+// 自分のルーム一覧
+app.get("/api/rooms/:userId", (req, res) => {
+  const list = [];
+  rooms.forEach((room) => {
+    if (room.members.includes(req.params.userId)) {
+      list.push(pubRoom(room, req.params.userId));
+    }
   });
-}
+  list.sort((a, b) => (b.lastMessage?.ts ?? 0) - (a.lastMessage?.ts ?? 0));
+  res.json(list);
+});
+
+// メッセージ一覧
+app.get("/api/rooms/:roomId/messages", (req, res) => {
+  const room = rooms.get(req.params.roomId);
+  res.json(room ? room.messages : []);
+});
+
+// ─────────────────────────────────────────
+//  WebSocket
+// ─────────────────────────────────────────
+const server = http.createServer(app);
+const wss    = new WebSocket.Server({ server });
 
 wss.on("connection", (ws) => {
-  let currentRoom = null;
+  let myId = null;
 
   ws.on("message", (raw) => {
-    let data;
-    try { data = JSON.parse(raw); } catch { return; }
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
 
-    switch (data.type) {
-      // ルームに参加
-      case "JOIN_ROOM": {
-        // 前のルームから離脱
-        if (currentRoom) {
-          const prev = roomClients.get(currentRoom);
-          if (prev) prev.delete(ws);
-        }
-        currentRoom = data.roomId;
-        if (!roomClients.has(currentRoom)) roomClients.set(currentRoom, new Set());
-        roomClients.get(currentRoom).add(ws);
+    switch (msg.type) {
 
-        // 既読にする
-        const room = db.rooms.find((r) => r.id === currentRoom);
-        if (room) room.unread = 0;
+      // ─── ログイン ───────────────────────
+      case "LOGIN": {
+        const { name, avatar } = msg;
+        if (!name?.trim()) return;
 
-        // 最新メッセージを返す
+        myId = uuid();
+        users.set(myId, { id: myId, name: name.trim(), avatar: avatar || "😊", ws });
+
+        // ① 自分にセッション情報を返す
         ws.send(JSON.stringify({
-          type: "ROOM_HISTORY",
-          payload: db.messages[currentRoom] || [],
+          type:  "SESSION",
+          me:    pubUser(users.get(myId)),
+          users: [...users.values()]
+                   .filter((u) => u.id !== myId)
+                   .map(pubUser),
+        }));
+
+        // ② 全員に新規ユーザーを通知
+        broadcast({ type: "USER_JOINED", user: pubUser(users.get(myId)) }, myId);
+
+        console.log(`[+] ${name} (${myId})`);
+        break;
+      }
+
+      // ─── ルーム開始 ────────────────────
+      case "OPEN_ROOM": {
+        if (!myId) return;
+        const { partnerId } = msg;
+        const rid = roomId(myId, partnerId);
+
+        if (!rooms.has(rid)) {
+          rooms.set(rid, {
+            id:      rid,
+            members: [myId, partnerId],
+            messages: [],
+            unread:  { [myId]: 0, [partnerId]: 0 },
+          });
+        }
+
+        const room = rooms.get(rid);
+        room.unread[myId] = 0;
+
+        // 開いた本人に履歴を返す
+        ws.send(JSON.stringify({
+          type:     "ROOM_OPENED",
+          room:     pubRoom(room, myId),
+          messages: room.messages,
         }));
         break;
       }
 
-      // メッセージ送信
+      // ─── メッセージ送信 ─────────────────
       case "SEND_MESSAGE": {
-        const { roomId, text, msgType = "text" } = data;
-        const msg = {
-          id: uuidv4(),
-          roomId,
-          senderId: "me",
-          text,
-          type: msgType,
-          ts: Date.now(),
+        if (!myId) return;
+        const { rid, text, kind = "text" } = msg;
+        if (!text?.trim() && kind === "text") return;
+
+        const room = rooms.get(rid);
+        if (!room || !room.members.includes(myId)) return;
+
+        const newMsg = {
+          id:       uuid(),
+          rid,
+          senderId: myId,
+          text:     text.trim(),
+          kind,
+          ts:       Date.now(),
         };
-        if (!db.messages[roomId]) db.messages[roomId] = [];
-        db.messages[roomId].push(msg);
 
-        const rm = db.rooms.find((r) => r.id === roomId);
-        if (rm) rm.unread = 0;
+        room.messages.push(newMsg);
 
-        broadcastToRoom(roomId, { type: "NEW_MESSAGE", payload: msg });
+        // 相手の未読を増やす
+        room.members.forEach((uid) => {
+          if (uid !== myId) room.unread[uid] = (room.unread[uid] ?? 0) + 1;
+        });
 
-        // 相手の自動返信（デモ用）
-        setTimeout(() => {
-          const replies = ["なるほど！", "了解です〜", "ありがとう！", "いいね！", "😊", "そうですね！", "わかった！"];
-          const reply = {
-            id: uuidv4(),
-            roomId,
-            senderId: data.contactId || "user-1",
-            text: replies[Math.floor(Math.random() * replies.length)],
-            type: "text",
-            ts: Date.now(),
-          };
-          db.messages[roomId].push(reply);
-          broadcastToRoom(roomId, { type: "NEW_MESSAGE", payload: reply });
-        }, 800 + Math.random() * 1200);
+        // ルーム全員に新着通知
+        broadcastRoom(rid, { type: "NEW_MESSAGE", msg: newMsg });
         break;
       }
 
-      // タイピング中
+      // ─── 既読 ──────────────────────────
+      case "READ": {
+        const room = rooms.get(msg.rid);
+        if (room && myId) room.unread[myId] = 0;
+        break;
+      }
+
+      // ─── タイピング ─────────────────────
       case "TYPING": {
-        broadcastToRoom(data.roomId, { type: "TYPING", senderId: "me" });
+        if (!myId) return;
+        const room = rooms.get(msg.rid);
+        if (!room) return;
+        room.members.forEach((uid) => {
+          if (uid !== myId) sendTo(uid, { type: "TYPING", rid: msg.rid });
+        });
         break;
       }
     }
   });
 
   ws.on("close", () => {
-    if (currentRoom) {
-      const clients = roomClients.get(currentRoom);
-      if (clients) clients.delete(ws);
-    }
+    if (!myId) return;
+    const u = users.get(myId);
+    users.delete(myId);
+    console.log(`[-] ${u?.name} (${myId})`);
+    broadcast({ type: "USER_LEFT", userId: myId });
   });
+
+  ws.on("error", (err) => console.error("WS error:", err.message));
 });
 
+// ─────────────────────────────────────────
+//  Start
+// ─────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`✅  LINE拡張機能 バックエンド起動中 → http://localhost:${PORT}`);
-  console.log(`🔌  WebSocket → ws://localhost:${PORT}`);
+  console.log(`✅ LINE-chat server running on port ${PORT}`);
 });
